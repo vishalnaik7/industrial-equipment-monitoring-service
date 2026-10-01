@@ -36,13 +36,18 @@ curl localhost:8000/v1/summary
 
 Auth: set `API_KEYS=k1,k2` and send `X-API-Key`; unset = open (dev only). Probes stay open.
 
-Example (`GET /v1/machines/EQ-008` after loading the conflicting-updates sample, abridged):
+Example (`GET /v1/machines/EQ-008` after loading `sample_payloads/conflicting_updates.json`, abridged — real output):
 ```json
 {"machine_id":"EQ-008","plant_id":"PLANT_02","line_id":"LINE-E","derived_status":"critical","needs_attention":true,
- "attention_level":4,"reason_codes":["MULTI_SOURCE_CORROBORATION","HIGH_TEMPERATURE","INSPECTION_MAJOR_DEFECT","CONFLICTING_SOURCES"],
- "reasons":[{"code":"HIGH_TEMPERATURE","level":4,"source":"ThermexWatch","record_id":"TW-9921","detail":"ThermexWatch reported HIGH_TEMPERATURE with severity critical"}],
- "latest_relevant_event_time":"2026-04-18T08:41:00Z","source_event_refs":[{"source":"ThermexWatch","record_id":"TW-9921"}],
- "processing_status":{"status":"fresh","pending_records":0,"failed_records":0,"data_age_seconds":42},"last_processed_at":"..."}
+ "attention_level":4,"reason_codes":["HIGH_TEMPERATURE","TEMP_OVER_RATED_LIMIT","INSPECTION_MAJOR_DEFECT","CONFLICTING_SOURCES"],
+ "reasons":[
+  {"code":"HIGH_TEMPERATURE","level":4,"source":"ThermexWatch","record_id":"TW-9921"},
+  {"code":"INSPECTION_MAJOR_DEFECT","level":3,"source":"MaintaFlow","record_id":"MF-801"},
+  {"code":"CONFLICTING_SOURCES","level":1,"source":"system","detail":"PulseForge reports RECOVERY at ... but another source still reports an alert; alert kept (pessimistic)"},
+  {"code":"RECOVERY_REPORTED","level":0,"source":"PulseForge","record_id":"PF-1401"}],
+ "latest_relevant_event_time":"2026-04-18T08:41:00Z",
+ "source_event_refs":[{"source":"MaintaFlow","record_id":"MF-801"},{"source":"PulseForge","record_id":"PF-1401"},{"source":"ThermexWatch","record_id":"TW-9921"}],
+ "processing_status":{"status":"fresh","pending_records":0,"failed_records":0,"rejected_records":0}}
 ```
 
 ## How the messy-data requirements are handled
