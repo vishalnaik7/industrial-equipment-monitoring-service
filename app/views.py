@@ -23,14 +23,14 @@ def _processing(row, counts: dict, now, s: Settings) -> dict:
     age = None
     if row is not None and row["latest_relevant_event_time"]:
         age = int((now - timeutil.from_iso(row["latest_relevant_event_time"])).total_seconds())
-    if row is None and not pending:
-        status = "no_data"
-    elif pending:
+    if pending:
         status = "pending"
     elif dead:
         status = "failed"
     elif rejected:
-        status = "partial"
+        status = "partial"        # some of this machine's records could not be processed
+    elif row is None:
+        status = "no_data"
     elif age is not None and age > s.stale_after_minutes * 60:
         status = "stale"
     else:

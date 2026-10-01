@@ -108,8 +108,11 @@ def derive_machine_state(asset: dict, events: list[dict], s: Settings) -> dict:
             elif dev >= 0.25:
                 add("POWER_DEVIATION", 2, f"{kw} kW deviates {dev:.0%} from baseline {base} kW")
 
-    alerting = [r for r in reasons if r["level"] >= 2]
     clears = [e for e in active if e["event_code"] in CLEAR_CODES]
+    for c in clears:                                    # informational (level 0) so the explanation is complete
+        reasons.append(_reason(f"{c['event_code']}_REPORTED", 0, c["vendor"], c["source_record_id"],
+                               c["event_time"], f"{c['vendor']} latest reading reports {c['event_code']}"))
+    alerting = [r for r in reasons if r["level"] >= 2]
     if alerting and clears:
         reasons.append(_reason("CONFLICTING_SOURCES", 1, "system", None, None,
                                "; ".join(f"{c['vendor']} reports {c['event_code']} at {c['event_time']}" for c in clears)
