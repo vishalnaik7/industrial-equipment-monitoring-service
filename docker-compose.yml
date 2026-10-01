@@ -1,0 +1,24 @@
+# api (HTTP) and worker (background processing) run as separate containers sharing one SQLite file (WAL).
+# Scale workers with `docker compose up --scale worker=3` -- claiming is lease-based so this is safe.
+services:
+  api:
+    build: .
+    ports: ["8000:8000"]
+    environment:
+      WORKER_EMBEDDED: "false"
+      API_KEYS: "${API_KEYS:-}"            # e.g. API_KEYS=dev-key docker compose up
+      STALE_AFTER_MINUTES: "${STALE_AFTER_MINUTES:-30}"
+    volumes: [dbdata:/data]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      retries: 5
+  worker:
+    build: .
+    command: ["python", "-m", "app.worker"]
+    environment:
+      API_KEYS: "${API_KEYS:-}"
+    volumes: [dbdata:/data]
+    depends_on: [api]
+volumes:
+  dbdata:
