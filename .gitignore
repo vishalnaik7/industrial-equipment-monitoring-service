@@ -1,5 +1,42 @@
+# Secrets and local configuration (.env.example is the committed template)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Local databases (recreated on start) and logs
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.log
+logs/
+# legacy local DB folder from before the backend/ split
+/data/
+
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
 .pytest_cache/
-data/*.db*
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
 .venv/
+venv/
+
+# Node / frontend build output
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+.vite/
+
+# Editors and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

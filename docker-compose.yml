@@ -1,24 +1,32 @@
-# api (HTTP) and worker (background processing) run as separate containers sharing one SQLite file (WAL).
-# Scale workers with `docker compose up --scale worker=3` -- claiming is lease-based so this is safe.
+# backend/  -> api (HTTP) and worker (background processing): two containers sharing one SQLite file (WAL).
+#              Scale workers with `docker compose up --scale worker=3` -- claiming is lease-based so this is safe.
+# frontend/ -> nginx serving the dashboard and proxying the API (same origin): http://localhost:8080
 services:
   api:
-    build: .
+    build: ./backend
     ports: ["8000:8000"]
     environment:
       WORKER_EMBEDDED: "false"
       API_KEYS: "${API_KEYS:-}"            # e.g. API_KEYS=dev-key docker compose up
       STALE_AFTER_MINUTES: "${STALE_AFTER_MINUTES:-30}"
+      CORS_ORIGINS: "${CORS_ORIGINS:-}"    # not needed behind the frontend proxy
     volumes: [dbdata:/data]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 10s
       retries: 5
   worker:
-    build: .
+    build: ./backend
     command: ["python", "-m", "app.worker"]
     environment:
       API_KEYS: "${API_KEYS:-}"
     volumes: [dbdata:/data]
     depends_on: [api]
+  frontend:
+    build: ./frontend
+    ports: ["8080:80"]
+    depends_on:
+      api:
+        condition: service_healthy
 volumes:
   dbdata:

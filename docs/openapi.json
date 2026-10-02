@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Aurik Equipment Monitoring API",
-    "description": "Vendor ingestion, normalization and machine operational attention view.",
-    "version": "1.0.0"
+    "description": "\nIngests machine data from three vendors with inconsistent schemas plus the internal CMMS work-order feed, normalizes\nit into one canonical model\n**asynchronously**, and serves an **explainable machine operational attention view** plus plant/line summaries.\n\n* **Ingestion** returns `202` + `batch_id` immediately; poll `/v1/batches/{id}`.\n* **Validation**: envelopes are validated synchronously (4xx); record values asynchronously (warn vs reject).\n  Use `/v1/ingest/{vendor}/validate` for a synchronous dry run.\n* **Errors** always have the shape `{\"error\": {\"code\", \"message\", \"details\"?, \"request_id\"?}}`.\n* **Auth**: send `X-API-Key` when the server runs with `API_KEYS` set.\n* **Dashboard**: separate static app in `frontend/` (http://localhost:8080 with Docker Compose).\n",
+    "version": "1.5.0"
   },
   "paths": {
     "/health": {
@@ -11,7 +11,7 @@
         "tags": [
           "ops"
         ],
-        "summary": "Health",
+        "summary": "Liveness probe",
         "operationId": "health_health_get",
         "responses": {
           "200": {
@@ -30,7 +30,7 @@
         "tags": [
           "ops"
         ],
-        "summary": "Ready",
+        "summary": "Readiness probe with queue depth and dead-letter count",
         "operationId": "ready_ready_get",
         "responses": {
           "200": {
@@ -44,112 +44,20 @@
         }
       }
     },
-    "/v1/ingest/{vendor}": {
-      "post": {
-        "tags": [
-          "ingestion"
-        ],
-        "summary": "Ingest Vendor",
-        "description": "Accept a vendor batch (pulseforge | thermexwatch | maintaflow). Returns 202 + batch_id immediately;\nnormalization and state derivation happen asynchronously. Replaying an identical body returns 200.",
-        "operationId": "ingest_vendor_v1_ingest__vendor__post",
-        "parameters": [
-          {
-            "name": "vendor",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "title": "Vendor"
-            }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Api-Key"
-            }
-          }
-        ],
-        "responses": {
-          "202": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/batches/{batch_id}": {
+    "/v1/meta": {
       "get": {
         "tags": [
-          "processing"
+          "ops"
         ],
-        "summary": "Get Batch",
-        "operationId": "get_batch_v1_batches__batch_id__get",
-        "parameters": [
-          {
-            "name": "batch_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "title": "Batch Id"
-            }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Api-Key"
-            }
-          }
-        ],
+        "summary": "Service metadata (versions, auth mode, limits)",
+        "operationId": "meta_v1_meta_get",
         "responses": {
           "200": {
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/Meta"
                 }
               }
             }
@@ -157,14 +65,754 @@
         }
       }
     },
-    "/v1/dead-letters": {
+    "/v1/ingest/pulseforge": {
+      "post": {
+        "tags": [
+          "ingestion"
+        ],
+        "summary": "Ingest a PulseForge batch",
+        "description": "Accepts a PulseForge envelope with a non-empty `events` list. Returns **202** with a `batch_id` immediately; normalization and state derivation run asynchronously - poll `status_url`. Re-sending an identical body returns **200** with the original batch (`replayed: true`). Record *values* are validated asynchronously (warn vs reject).",
+        "operationId": "ingest_pulseforge_v1_ingest_pulseforge_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PulseForgeBatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchAccepted"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Content Too Large",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable Content",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Identical request already received",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchAccepted"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ]
+      }
+    },
+    "/v1/ingest/pulseforge/validate": {
+      "post": {
+        "tags": [
+          "ingestion"
+        ],
+        "summary": "Dry-run validate a PulseForge batch (nothing stored)",
+        "description": "Runs envelope validation and full per-record normalization synchronously and reports, for every record, whether it would be valid / valid with warnings / rejected and whether it would be stored as new, duplicate or a revision.",
+        "operationId": "validate_pulseforge_v1_ingest_pulseforge_validate_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PulseForgeBatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationReport"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Content Too Large",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable Content",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ]
+      }
+    },
+    "/v1/ingest/thermexwatch": {
+      "post": {
+        "tags": [
+          "ingestion"
+        ],
+        "summary": "Ingest a ThermexWatch batch",
+        "description": "Accepts a ThermexWatch envelope with a non-empty `readings` list. Returns **202** with a `batch_id` immediately; normalization and state derivation run asynchronously - poll `status_url`. Re-sending an identical body returns **200** with the original batch (`replayed: true`). Record *values* are validated asynchronously (warn vs reject).",
+        "operationId": "ingest_thermexwatch_v1_ingest_thermexwatch_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ThermexWatchBatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchAccepted"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Content Too Large",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable Content",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Identical request already received",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchAccepted"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ]
+      }
+    },
+    "/v1/ingest/thermexwatch/validate": {
+      "post": {
+        "tags": [
+          "ingestion"
+        ],
+        "summary": "Dry-run validate a ThermexWatch batch (nothing stored)",
+        "description": "Runs envelope validation and full per-record normalization synchronously and reports, for every record, whether it would be valid / valid with warnings / rejected and whether it would be stored as new, duplicate or a revision.",
+        "operationId": "validate_thermexwatch_v1_ingest_thermexwatch_validate_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ThermexWatchBatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationReport"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Content Too Large",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable Content",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ]
+      }
+    },
+    "/v1/ingest/maintaflow": {
+      "post": {
+        "tags": [
+          "ingestion"
+        ],
+        "summary": "Ingest a MaintaFlow batch",
+        "description": "Accepts a MaintaFlow envelope with a non-empty `records` list. Returns **202** with a `batch_id` immediately; normalization and state derivation run asynchronously - poll `status_url`. Re-sending an identical body returns **200** with the original batch (`replayed: true`). Record *values* are validated asynchronously (warn vs reject).",
+        "operationId": "ingest_maintaflow_v1_ingest_maintaflow_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MaintaFlowBatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchAccepted"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Content Too Large",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable Content",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Identical request already received",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchAccepted"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ]
+      }
+    },
+    "/v1/ingest/maintaflow/validate": {
+      "post": {
+        "tags": [
+          "ingestion"
+        ],
+        "summary": "Dry-run validate a MaintaFlow batch (nothing stored)",
+        "description": "Runs envelope validation and full per-record normalization synchronously and reports, for every record, whether it would be valid / valid with warnings / rejected and whether it would be stored as new, duplicate or a revision.",
+        "operationId": "validate_maintaflow_v1_ingest_maintaflow_validate_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MaintaFlowBatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationReport"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Content Too Large",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable Content",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ]
+      }
+    },
+    "/v1/ingest/workorders": {
+      "post": {
+        "tags": [
+          "ingestion"
+        ],
+        "summary": "Ingest a CMMS batch",
+        "description": "Accepts a CMMS envelope with a non-empty `work_orders` list. Returns **202** with a `batch_id` immediately; normalization and state derivation run asynchronously - poll `status_url`. Re-sending an identical body returns **200** with the original batch (`replayed: true`). Record *values* are validated asynchronously (warn vs reject).",
+        "operationId": "ingest_workorders_v1_ingest_workorders_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkOrderBatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchAccepted"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Content Too Large",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable Content",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Identical request already received",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchAccepted"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ]
+      }
+    },
+    "/v1/ingest/workorders/validate": {
+      "post": {
+        "tags": [
+          "ingestion"
+        ],
+        "summary": "Dry-run validate a CMMS batch (nothing stored)",
+        "description": "Runs envelope validation and full per-record normalization synchronously and reports, for every record, whether it would be valid / valid with warnings / rejected and whether it would be stored as new, duplicate or a revision.",
+        "operationId": "validate_workorders_v1_ingest_workorders_validate_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkOrderBatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationReport"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Content Too Large",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable Content",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ]
+      }
+    },
+    "/v1/batches": {
       "get": {
         "tags": [
           "processing"
         ],
-        "summary": "Dead Letters",
-        "description": "Records that were rejected (permanent: bad data) or dead (transient failures exhausted).",
-        "operationId": "dead_letters_v1_dead_letters_get",
+        "summary": "Recent ingestion batches with their processing state",
+        "operationId": "list_batches_v1_batches_get",
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
         "parameters": [
           {
             "name": "limit",
@@ -174,24 +822,26 @@
               "type": "integer",
               "maximum": 1000,
               "minimum": 1,
-              "default": 100,
+              "description": "Maximum items to return",
+              "default": 50,
               "title": "Limit"
-            }
+            },
+            "description": "Maximum items to return"
           },
           {
-            "name": "x-api-key",
-            "in": "header",
+            "name": "vendor",
+            "in": "query",
             "required": false,
             "schema": {
               "anyOf": [
                 {
-                  "type": "string"
+                  "$ref": "#/components/schemas/VendorSlug"
                 },
                 {
                   "type": "null"
                 }
               ],
-              "title": "X-Api-Key"
+              "title": "Vendor"
             }
           }
         ],
@@ -200,19 +850,361 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/BatchList"
                 }
               }
             }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Content Too Large"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Content"
+          }
+        }
+      }
+    },
+    "/v1/batches/{batch_id}": {
+      "get": {
+        "tags": [
+          "processing"
+        ],
+        "summary": "Processing status of one batch",
+        "operationId": "get_batch_v1_batches__batch_id__get",
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "batch_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Batch Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchStatus"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Content Too Large"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Content"
+          }
+        }
+      }
+    },
+    "/v1/batches/{batch_id}/raw": {
+      "get": {
+        "tags": [
+          "processing"
+        ],
+        "summary": "The batch request body exactly as received",
+        "operationId": "get_batch_raw_v1_batches__batch_id__raw_get",
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "batch_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Batch Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Byte-for-byte original body",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Content Too Large"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Content"
+          }
+        }
+      }
+    },
+    "/v1/dead-letters": {
+      "get": {
+        "tags": [
+          "processing"
+        ],
+        "summary": "Rejected (bad data) and dead (retries exhausted) records",
+        "operationId": "dead_letters_v1_dead_letters_get",
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 1000,
+              "minimum": 1,
+              "description": "Maximum items to return",
+              "default": 100,
+              "title": "Limit"
+            },
+            "description": "Maximum items to return"
+          },
+          {
+            "name": "vendor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/VendorSlug"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Vendor"
+            }
+          },
+          {
+            "name": "error_code",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "pattern": "^[A-Z_]{2,64}$"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "examples": [
+                "UNKNOWN_MACHINE"
+              ],
+              "title": "Error Code"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeadLetterList"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Content Too Large"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Content"
           }
         }
       }
@@ -222,9 +1214,13 @@
         "tags": [
           "processing"
         ],
-        "summary": "Replay Dead Letter",
-        "description": "Re-queue a rejected/dead record (e.g. after the asset reference or mapping was fixed).",
+        "summary": "Re-queue a rejected/dead record (e.g. after fixing reference data)",
         "operationId": "replay_dead_letter_v1_dead_letters__raw_id__replay_post",
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
         "parameters": [
           {
             "name": "raw_id",
@@ -232,23 +1228,8 @@
             "required": true,
             "schema": {
               "type": "integer",
+              "minimum": 1,
               "title": "Raw Id"
-            }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Api-Key"
             }
           }
         ],
@@ -257,19 +1238,61 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/ReplayAccepted"
                 }
               }
             }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Content Too Large"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Content"
           }
         }
       }
@@ -279,17 +1302,20 @@
         "tags": [
           "processing"
         ],
-        "summary": "Trace Record",
-        "description": "Traceability: raw payload revisions + resulting canonical event for one vendor record.",
+        "summary": "Traceability: every raw revision + resulting canonical event",
         "operationId": "trace_record_v1_records__vendor___record_id__get",
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
         "parameters": [
           {
             "name": "vendor",
             "in": "path",
             "required": true,
             "schema": {
-              "type": "string",
-              "title": "Vendor"
+              "$ref": "#/components/schemas/VendorSlug"
             }
           },
           {
@@ -298,23 +1324,12 @@
             "required": true,
             "schema": {
               "type": "string",
-              "title": "Record Id"
-            }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
+              "minLength": 1,
+              "maxLength": 200,
+              "examples": [
+                "PF-1001"
               ],
-              "title": "X-Api-Key"
+              "title": "Record Id"
             }
           }
         ],
@@ -323,19 +1338,61 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/RecordTrace"
                 }
               }
             }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Content Too Large"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Content"
           }
         }
       }
@@ -345,8 +1402,13 @@
         "tags": [
           "operational-view"
         ],
-        "summary": "Machines",
-        "operationId": "machines_v1_machines_get",
+        "summary": "Machine attention view (most urgent first)",
+        "operationId": "list_machines_v1_machines_get",
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
         "parameters": [
           {
             "name": "plant_id",
@@ -355,14 +1417,17 @@
             "schema": {
               "anyOf": [
                 {
-                  "type": "string"
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9_\\-]{1,32}$"
                 },
                 {
                   "type": "null"
                 }
               ],
+              "description": "e.g. PLANT_01",
               "title": "Plant Id"
-            }
+            },
+            "description": "e.g. PLANT_01"
           },
           {
             "name": "line_id",
@@ -371,14 +1436,17 @@
             "schema": {
               "anyOf": [
                 {
-                  "type": "string"
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9_\\-]{1,32}$"
                 },
                 {
                   "type": "null"
                 }
               ],
+              "description": "e.g. LINE-A",
               "title": "Line Id"
-            }
+            },
+            "description": "e.g. LINE-A"
           },
           {
             "name": "status",
@@ -387,7 +1455,7 @@
             "schema": {
               "anyOf": [
                 {
-                  "type": "string"
+                  "$ref": "#/components/schemas/DerivedStatus"
                 },
                 {
                   "type": "null"
@@ -411,22 +1479,6 @@
               ],
               "title": "Needs Attention"
             }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Api-Key"
-            }
           }
         ],
         "responses": {
@@ -434,19 +1486,61 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/MachineList"
                 }
               }
             }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Content Too Large"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Content"
           }
         }
       }
@@ -456,8 +1550,13 @@
         "tags": [
           "operational-view"
         ],
-        "summary": "Machine",
-        "operationId": "machine_v1_machines__machine_id__get",
+        "summary": "One machine: status, attention, reasons, signals, source refs, freshness",
+        "operationId": "get_machine_v1_machines__machine_id__get",
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
         "parameters": [
           {
             "name": "machine_id",
@@ -465,23 +1564,11 @@
             "required": true,
             "schema": {
               "type": "string",
-              "title": "Machine Id"
-            }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
+              "pattern": "^[A-Za-z0-9_\\- ]{1,32}$",
+              "examples": [
+                "EQ-001"
               ],
-              "title": "X-Api-Key"
+              "title": "Machine Id"
             }
           }
         ],
@@ -490,19 +1577,61 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/MachineView"
                 }
               }
             }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Content Too Large"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Content"
           }
         }
       }
@@ -512,23 +1641,101 @@
         "tags": [
           "operational-view"
         ],
-        "summary": "Summary All",
+        "summary": "All plants: status counts, ranked lines, data quality",
         "operationId": "summary_all_v1_summary_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Summary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Content Too Large",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable Content",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ]
+      }
+    },
+    "/v1/summary/plants/{plant_id}": {
+      "get": {
+        "tags": [
+          "operational-view"
+        ],
+        "summary": "One plant: same shape as /v1/summary",
+        "operationId": "summary_plant_v1_summary_plants__plant_id__get",
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
         "parameters": [
           {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
+            "name": "plant_id",
+            "in": "path",
+            "required": true,
             "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_\\-]{1,32}$",
+              "examples": [
+                "PLANT_01"
               ],
-              "title": "X-Api-Key"
+              "title": "Plant Id"
             }
           }
         ],
@@ -537,54 +1744,187 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/Summary"
                 }
               }
             }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Content Too Large"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Content"
           }
         }
       }
     },
-    "/v1/summary/plants/{plant_id}": {
+    "/v1/reference": {
       "get": {
         "tags": [
-          "operational-view"
+          "operational-view",
+          "reference"
         ],
-        "summary": "Summary Plant",
-        "operationId": "summary_plant_v1_summary_plants__plant_id__get",
+        "summary": "Plants -> lines -> machine ids (from the asset/line reference)",
+        "operationId": "reference_v1_reference_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReferenceData"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Content Too Large",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable Content",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ]
+      }
+    },
+    "/v1/samples": {
+      "get": {
+        "tags": [
+          "demo"
+        ],
+        "summary": "List bundled sample payload files and the vendors each contains",
+        "operationId": "list_samples_v1_samples_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ]
+      }
+    },
+    "/v1/samples/{name}": {
+      "get": {
+        "tags": [
+          "demo"
+        ],
+        "summary": "Get one sample, split into one request body per vendor",
+        "operationId": "get_sample_v1_samples__name__get",
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
         "parameters": [
           {
-            "name": "plant_id",
+            "name": "name",
             "in": "path",
             "required": true,
             "schema": {
               "type": "string",
-              "title": "Plant Id"
-            }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Api-Key"
+              "pattern": "^[a-z0-9_]{1,64}$",
+              "title": "Name"
             }
           }
         ],
@@ -613,6 +1953,480 @@
   },
   "components": {
     "schemas": {
+      "BatchAccepted": {
+        "properties": {
+          "batch_id": {
+            "type": "string",
+            "title": "Batch Id"
+          },
+          "vendor": {
+            "type": "string",
+            "title": "Vendor"
+          },
+          "schema_version": {
+            "type": "string",
+            "title": "Schema Version"
+          },
+          "received_at": {
+            "type": "string",
+            "title": "Received At"
+          },
+          "total_records": {
+            "type": "integer",
+            "title": "Total Records"
+          },
+          "accepted_records": {
+            "type": "integer",
+            "title": "Accepted Records",
+            "description": "Stored and queued for async processing"
+          },
+          "duplicate_records": {
+            "type": "integer",
+            "title": "Duplicate Records",
+            "description": "Same id + identical payload as an already stored record"
+          },
+          "revised_records": {
+            "type": "integer",
+            "title": "Revised Records",
+            "description": "Same id, different payload -> new revision (latest wins)"
+          },
+          "replayed": {
+            "type": "boolean",
+            "title": "Replayed",
+            "description": "True when the identical request was already received (HTTP 200)"
+          },
+          "status_url": {
+            "type": "string",
+            "title": "Status Url"
+          }
+        },
+        "type": "object",
+        "required": [
+          "batch_id",
+          "vendor",
+          "schema_version",
+          "received_at",
+          "total_records",
+          "accepted_records",
+          "duplicate_records",
+          "revised_records",
+          "replayed",
+          "status_url"
+        ],
+        "title": "BatchAccepted"
+      },
+      "BatchList": {
+        "properties": {
+          "count": {
+            "type": "integer",
+            "title": "Count"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/BatchListItem"
+            },
+            "type": "array",
+            "title": "Items"
+          }
+        },
+        "type": "object",
+        "required": [
+          "count",
+          "items"
+        ],
+        "title": "BatchList"
+      },
+      "BatchListItem": {
+        "properties": {
+          "batch_id": {
+            "type": "string",
+            "title": "Batch Id"
+          },
+          "vendor": {
+            "type": "string",
+            "title": "Vendor"
+          },
+          "received_at": {
+            "type": "string",
+            "title": "Received At"
+          },
+          "total_records": {
+            "type": "integer",
+            "title": "Total Records"
+          },
+          "accepted_records": {
+            "type": "integer",
+            "title": "Accepted Records"
+          },
+          "duplicate_records": {
+            "type": "integer",
+            "title": "Duplicate Records"
+          },
+          "revised_records": {
+            "type": "integer",
+            "title": "Revised Records"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "processing",
+              "completed",
+              "completed_with_errors",
+              "failed"
+            ],
+            "title": "State"
+          }
+        },
+        "type": "object",
+        "required": [
+          "batch_id",
+          "vendor",
+          "received_at",
+          "total_records",
+          "accepted_records",
+          "duplicate_records",
+          "revised_records",
+          "state"
+        ],
+        "title": "BatchListItem"
+      },
+      "BatchStatus": {
+        "properties": {
+          "batch_id": {
+            "type": "string",
+            "title": "Batch Id"
+          },
+          "vendor": {
+            "type": "string",
+            "title": "Vendor"
+          },
+          "schema_version": {
+            "type": "string",
+            "title": "Schema Version"
+          },
+          "received_at": {
+            "type": "string",
+            "title": "Received At"
+          },
+          "total_records": {
+            "type": "integer",
+            "title": "Total Records"
+          },
+          "accepted_records": {
+            "type": "integer",
+            "title": "Accepted Records"
+          },
+          "duplicate_records": {
+            "type": "integer",
+            "title": "Duplicate Records"
+          },
+          "revised_records": {
+            "type": "integer",
+            "title": "Revised Records"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "processing",
+              "completed",
+              "completed_with_errors",
+              "failed"
+            ],
+            "title": "State"
+          },
+          "record_status_counts": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "Record Status Counts"
+          },
+          "errors": {
+            "items": {
+              "$ref": "#/components/schemas/RecordError"
+            },
+            "type": "array",
+            "title": "Errors"
+          }
+        },
+        "type": "object",
+        "required": [
+          "batch_id",
+          "vendor",
+          "schema_version",
+          "received_at",
+          "total_records",
+          "accepted_records",
+          "duplicate_records",
+          "revised_records",
+          "state",
+          "record_status_counts",
+          "errors"
+        ],
+        "title": "BatchStatus"
+      },
+      "DataQuality": {
+        "properties": {
+          "stale_machines": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Stale Machines"
+          },
+          "failed_machines": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Failed Machines"
+          },
+          "partial_machines": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Partial Machines"
+          },
+          "pending_machines": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Pending Machines"
+          },
+          "no_data_machines": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "No Data Machines"
+          }
+        },
+        "type": "object",
+        "required": [
+          "stale_machines",
+          "failed_machines",
+          "partial_machines",
+          "pending_machines",
+          "no_data_machines"
+        ],
+        "title": "DataQuality"
+      },
+      "DeadLetter": {
+        "properties": {
+          "raw_id": {
+            "type": "integer",
+            "title": "Raw Id"
+          },
+          "batch_id": {
+            "type": "string",
+            "title": "Batch Id"
+          },
+          "vendor": {
+            "type": "string",
+            "title": "Vendor"
+          },
+          "vendor_record_id": {
+            "type": "string",
+            "title": "Vendor Record Id"
+          },
+          "revision": {
+            "type": "integer",
+            "title": "Revision"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "rejected",
+              "dead"
+            ],
+            "title": "Status"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code"
+          },
+          "error_message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Message"
+          },
+          "attempts": {
+            "type": "integer",
+            "title": "Attempts"
+          },
+          "received_at": {
+            "type": "string",
+            "title": "Received At"
+          },
+          "processed_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Processed At"
+          },
+          "payload": {
+            "title": "Payload"
+          }
+        },
+        "type": "object",
+        "required": [
+          "raw_id",
+          "batch_id",
+          "vendor",
+          "vendor_record_id",
+          "revision",
+          "status",
+          "error_code",
+          "error_message",
+          "attempts",
+          "received_at",
+          "processed_at",
+          "payload"
+        ],
+        "title": "DeadLetter"
+      },
+      "DeadLetterList": {
+        "properties": {
+          "count": {
+            "type": "integer",
+            "title": "Count"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/DeadLetter"
+            },
+            "type": "array",
+            "title": "Items"
+          }
+        },
+        "type": "object",
+        "required": [
+          "count",
+          "items"
+        ],
+        "title": "DeadLetterList"
+      },
+      "DerivedStatus": {
+        "type": "string",
+        "enum": [
+          "critical",
+          "at_risk",
+          "degraded",
+          "watch",
+          "healthy",
+          "under_maintenance",
+          "offline",
+          "unknown"
+        ],
+        "title": "DerivedStatus"
+      },
+      "ErrorDetail": {
+        "properties": {
+          "field": {
+            "type": "string",
+            "title": "Field"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Type"
+          }
+        },
+        "type": "object",
+        "required": [
+          "field",
+          "message"
+        ],
+        "title": "ErrorDetail"
+      },
+      "ErrorInfo": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "title": "Code",
+            "examples": [
+              "VALIDATION_ERROR"
+            ]
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "details": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Details"
+          },
+          "request_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Request Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "ErrorInfo"
+      },
+      "ErrorResponse": {
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ErrorInfo"
+          }
+        },
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "title": "ErrorResponse"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -625,6 +2439,1271 @@
         },
         "type": "object",
         "title": "HTTPValidationError"
+      },
+      "LineRef": {
+        "properties": {
+          "line_id": {
+            "type": "string",
+            "title": "Line Id"
+          },
+          "line_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Line Name"
+          },
+          "operating_window": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Operating Window"
+          },
+          "machine_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Machine Ids"
+          }
+        },
+        "type": "object",
+        "required": [
+          "line_id",
+          "line_name",
+          "operating_window",
+          "machine_ids"
+        ],
+        "title": "LineRef"
+      },
+      "LineSummary": {
+        "properties": {
+          "plant_id": {
+            "type": "string",
+            "title": "Plant Id"
+          },
+          "line_id": {
+            "type": "string",
+            "title": "Line Id"
+          },
+          "line_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Line Name"
+          },
+          "machines_total": {
+            "type": "integer",
+            "title": "Machines Total"
+          },
+          "machines_needing_attention": {
+            "type": "integer",
+            "title": "Machines Needing Attention"
+          },
+          "critical_machines": {
+            "type": "integer",
+            "title": "Critical Machines"
+          },
+          "by_status": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "By Status"
+          }
+        },
+        "type": "object",
+        "required": [
+          "plant_id",
+          "line_id",
+          "line_name",
+          "machines_total",
+          "machines_needing_attention",
+          "critical_machines",
+          "by_status"
+        ],
+        "title": "LineSummary"
+      },
+      "MachineBrief": {
+        "properties": {
+          "machine_id": {
+            "type": "string",
+            "title": "Machine Id"
+          },
+          "plant_id": {
+            "type": "string",
+            "title": "Plant Id"
+          },
+          "line_id": {
+            "type": "string",
+            "title": "Line Id"
+          },
+          "attention_level": {
+            "type": "integer",
+            "title": "Attention Level"
+          },
+          "reason_codes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Reason Codes"
+          },
+          "latest_relevant_event_time": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latest Relevant Event Time"
+          }
+        },
+        "type": "object",
+        "required": [
+          "machine_id",
+          "plant_id",
+          "line_id",
+          "attention_level",
+          "reason_codes",
+          "latest_relevant_event_time"
+        ],
+        "title": "MachineBrief"
+      },
+      "MachineList": {
+        "properties": {
+          "count": {
+            "type": "integer",
+            "title": "Count"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/MachineView"
+            },
+            "type": "array",
+            "title": "Items"
+          }
+        },
+        "type": "object",
+        "required": [
+          "count",
+          "items"
+        ],
+        "title": "MachineList"
+      },
+      "MachineView": {
+        "properties": {
+          "machine_id": {
+            "type": "string",
+            "title": "Machine Id"
+          },
+          "plant_id": {
+            "type": "string",
+            "title": "Plant Id"
+          },
+          "line_id": {
+            "type": "string",
+            "title": "Line Id"
+          },
+          "machine_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Machine Type"
+          },
+          "criticality": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Criticality"
+          },
+          "derived_status": {
+            "$ref": "#/components/schemas/DerivedStatus"
+          },
+          "needs_attention": {
+            "type": "boolean",
+            "title": "Needs Attention"
+          },
+          "attention_level": {
+            "type": "integer",
+            "maximum": 4.0,
+            "minimum": 0.0,
+            "title": "Attention Level",
+            "description": "0 none .. 4 critical"
+          },
+          "attention_label": {
+            "type": "string",
+            "title": "Attention Label"
+          },
+          "reason_codes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Reason Codes",
+            "description": "Codes with level >= 1, most severe first"
+          },
+          "reasons": {
+            "items": {
+              "$ref": "#/components/schemas/Reason"
+            },
+            "type": "array",
+            "title": "Reasons",
+            "description": "Full explanation, including informational (level 0) reasons"
+          },
+          "latest_signals": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array",
+            "title": "Latest Signals",
+            "description": "Newest relevant reading per source"
+          },
+          "machine_state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Machine State"
+          },
+          "latest_relevant_event_time": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latest Relevant Event Time"
+          },
+          "source_event_refs": {
+            "items": {
+              "$ref": "#/components/schemas/SourceRef"
+            },
+            "type": "array",
+            "title": "Source Event Refs"
+          },
+          "last_processed_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Processed At"
+          },
+          "state_version": {
+            "type": "integer",
+            "title": "State Version",
+            "description": "Increments only when the derived content changes"
+          },
+          "rules_version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rules Version"
+          },
+          "processing_status": {
+            "$ref": "#/components/schemas/ProcessingStatus"
+          }
+        },
+        "type": "object",
+        "required": [
+          "machine_id",
+          "plant_id",
+          "line_id",
+          "machine_type",
+          "criticality",
+          "derived_status",
+          "needs_attention",
+          "attention_level",
+          "attention_label",
+          "reason_codes",
+          "reasons",
+          "latest_signals",
+          "machine_state",
+          "latest_relevant_event_time",
+          "source_event_refs",
+          "last_processed_at",
+          "state_version",
+          "rules_version",
+          "processing_status"
+        ],
+        "title": "MachineView"
+      },
+      "MaintaFlowBatch": {
+        "properties": {
+          "provider_name": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Name",
+            "examples": [
+              "MaintaFlow"
+            ]
+          },
+          "factory_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Factory Id",
+            "examples": [
+              "PLANT_01"
+            ]
+          },
+          "records": {
+            "items": {
+              "$ref": "#/components/schemas/MaintaFlowRecord"
+            },
+            "type": "array",
+            "minItems": 1,
+            "title": "Records",
+            "description": "Non-empty list of record objects"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "records"
+        ],
+        "title": "MaintaFlowBatch"
+      },
+      "MaintaFlowRecord": {
+        "properties": {
+          "record_id": {
+            "title": "Record Id",
+            "description": "Vendor record id - idempotency key (required)",
+            "examples": [
+              "MF-501"
+            ]
+          },
+          "machine_ref": {
+            "title": "Machine Ref",
+            "description": "Machine reference (required)",
+            "examples": [
+              "EQ-001"
+            ]
+          },
+          "line_ref": {
+            "title": "Line Ref",
+            "description": "Line reference",
+            "examples": [
+              "LINE-A"
+            ]
+          },
+          "recorded_at": {
+            "title": "Recorded At",
+            "description": "'YYYY/MM/DD HH:MM:SS' in MAINTAFLOW_TZ, or ISO-8601 (required)",
+            "examples": [
+              "2026/04/18 08:14:05"
+            ]
+          },
+          "record_type": {
+            "title": "Record Type",
+            "description": "inspection | maintenance_update | operator_note | calibration (required)",
+            "examples": [
+              "inspection"
+            ]
+          },
+          "inspection_result": {
+            "title": "Inspection Result",
+            "description": "passed | passed_with_observation | minor_defect_found | major_defect_found | calibration_pending",
+            "examples": [
+              "minor_defect_found"
+            ]
+          },
+          "maintenance_status": {
+            "title": "Maintenance Status",
+            "description": "not_due | due_soon | overdue | completed | unknown",
+            "examples": [
+              "not_due"
+            ]
+          },
+          "days_since_last_service": {
+            "title": "Days Since Last Service",
+            "description": "Non-negative integer",
+            "examples": [
+              18
+            ]
+          },
+          "technician_note": {
+            "title": "Technician Note",
+            "description": "Free text (keywords such as 'leak', 'stall' raise attention)",
+            "examples": [
+              "Belt wear visible"
+            ]
+          },
+          "manual_confidence": {
+            "title": "Manual Confidence",
+            "description": "low | medium | high",
+            "examples": [
+              "medium"
+            ]
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "title": "MaintaFlowRecord"
+      },
+      "Meta": {
+        "properties": {
+          "service": {
+            "type": "string",
+            "title": "Service"
+          },
+          "version": {
+            "type": "string",
+            "title": "Version"
+          },
+          "rules_version": {
+            "type": "string",
+            "title": "Rules Version"
+          },
+          "schema_version": {
+            "type": "string",
+            "title": "Schema Version"
+          },
+          "auth_required": {
+            "type": "boolean",
+            "title": "Auth Required"
+          },
+          "vendors": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Vendors"
+          },
+          "stale_after_minutes": {
+            "type": "integer",
+            "title": "Stale After Minutes"
+          },
+          "max_records_per_batch": {
+            "type": "integer",
+            "title": "Max Records Per Batch"
+          }
+        },
+        "type": "object",
+        "required": [
+          "service",
+          "version",
+          "rules_version",
+          "schema_version",
+          "auth_required",
+          "vendors",
+          "stale_after_minutes",
+          "max_records_per_batch"
+        ],
+        "title": "Meta"
+      },
+      "PlantRef": {
+        "properties": {
+          "plant_id": {
+            "type": "string",
+            "title": "Plant Id"
+          },
+          "lines": {
+            "items": {
+              "$ref": "#/components/schemas/LineRef"
+            },
+            "type": "array",
+            "title": "Lines"
+          }
+        },
+        "type": "object",
+        "required": [
+          "plant_id",
+          "lines"
+        ],
+        "title": "PlantRef"
+      },
+      "ProcessingStatus": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "failed",
+              "partial",
+              "no_data",
+              "stale",
+              "fresh"
+            ],
+            "title": "Status"
+          },
+          "pending_records": {
+            "type": "integer",
+            "title": "Pending Records"
+          },
+          "failed_records": {
+            "type": "integer",
+            "title": "Failed Records"
+          },
+          "rejected_records": {
+            "type": "integer",
+            "title": "Rejected Records"
+          },
+          "data_age_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data Age Seconds",
+            "description": "Age of the newest event (event time), at read time"
+          },
+          "stale_after_minutes": {
+            "type": "integer",
+            "title": "Stale After Minutes"
+          },
+          "last_received_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Received At",
+            "description": "When data for this machine last arrived (receive time)"
+          }
+        },
+        "type": "object",
+        "required": [
+          "status",
+          "pending_records",
+          "failed_records",
+          "rejected_records",
+          "data_age_seconds",
+          "stale_after_minutes"
+        ],
+        "title": "ProcessingStatus"
+      },
+      "PulseForgeBatch": {
+        "properties": {
+          "vendor": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vendor",
+            "examples": [
+              "PulseForge"
+            ]
+          },
+          "plant_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plant Id",
+            "examples": [
+              "PLANT_01"
+            ]
+          },
+          "batch_generated_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Batch Generated At",
+            "examples": [
+              "2026-04-18T08:05:00Z"
+            ]
+          },
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/PulseForgeEvent"
+            },
+            "type": "array",
+            "minItems": 1,
+            "title": "Events",
+            "description": "Non-empty list of event objects"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "events"
+        ],
+        "title": "PulseForgeBatch"
+      },
+      "PulseForgeEvent": {
+        "properties": {
+          "event_id": {
+            "title": "Event Id",
+            "description": "Vendor event id - idempotency key (required)",
+            "examples": [
+              "PF-1001"
+            ]
+          },
+          "machine_id": {
+            "title": "Machine Id",
+            "description": "Machine reference, e.g. EQ-001 / eq_1 (required)",
+            "examples": [
+              "EQ-001"
+            ]
+          },
+          "line_id": {
+            "title": "Line Id",
+            "description": "Line reported by vendor; asset reference wins on mismatch",
+            "examples": [
+              "LINE-A"
+            ]
+          },
+          "event_time": {
+            "title": "Event Time",
+            "description": "ISO-8601; zone-less is assumed UTC (required)",
+            "examples": [
+              "2026-04-18T07:59:12Z"
+            ]
+          },
+          "event_type": {
+            "title": "Event Type",
+            "description": "HIGH_VIBRATION | TEMP_SPIKE | SENSOR_HEALTH_DROP | POWER_FLUCTUATION | RECOVERY_SIGNAL",
+            "examples": [
+              "HIGH_VIBRATION"
+            ]
+          },
+          "severity": {
+            "title": "Severity",
+            "description": "low | medium | high | critical",
+            "examples": [
+              "high"
+            ]
+          },
+          "vibration_mm_s": {
+            "title": "Vibration Mm S",
+            "description": "Vibration velocity, mm/s",
+            "examples": [
+              11.8
+            ]
+          },
+          "temperature_c": {
+            "title": "Temperature C",
+            "description": "Temperature, Celsius",
+            "examples": [
+              83.2
+            ]
+          },
+          "machine_state": {
+            "title": "Machine State",
+            "description": "running | idle | stopped | fault",
+            "examples": [
+              "running"
+            ]
+          },
+          "sensor_health": {
+            "title": "Sensor Health",
+            "description": "0..1; below 0.6 is treated as poor signal quality",
+            "examples": [
+              0.91
+            ]
+          },
+          "vendor_confidence": {
+            "title": "Vendor Confidence",
+            "description": "0..1",
+            "examples": [
+              0.87
+            ]
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "title": "PulseForgeEvent"
+      },
+      "Reason": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "title": "Code",
+            "examples": [
+              "TEMP_OVER_RATED_LIMIT"
+            ]
+          },
+          "level": {
+            "type": "integer",
+            "maximum": 4.0,
+            "minimum": 0.0,
+            "title": "Level"
+          },
+          "level_label": {
+            "type": "string",
+            "title": "Level Label"
+          },
+          "source": {
+            "type": "string",
+            "title": "Source",
+            "description": "Vendor name, 'system' (cross-source rule) or 'reference'"
+          },
+          "record_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Record Id"
+          },
+          "event_time": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Event Time"
+          },
+          "detail": {
+            "type": "string",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "required": [
+          "code",
+          "level",
+          "level_label",
+          "source",
+          "record_id",
+          "event_time",
+          "detail"
+        ],
+        "title": "Reason"
+      },
+      "RecordError": {
+        "properties": {
+          "raw_id": {
+            "type": "integer",
+            "title": "Raw Id"
+          },
+          "vendor_record_id": {
+            "type": "string",
+            "title": "Vendor Record Id"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code"
+          },
+          "error_message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Message"
+          },
+          "attempts": {
+            "type": "integer",
+            "title": "Attempts"
+          }
+        },
+        "type": "object",
+        "required": [
+          "raw_id",
+          "vendor_record_id",
+          "status",
+          "error_code",
+          "error_message",
+          "attempts"
+        ],
+        "title": "RecordError"
+      },
+      "RecordTrace": {
+        "properties": {
+          "vendor": {
+            "type": "string",
+            "title": "Vendor"
+          },
+          "record_id": {
+            "type": "string",
+            "title": "Record Id"
+          },
+          "raw_revisions": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array",
+            "title": "Raw Revisions"
+          },
+          "normalized_event": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Normalized Event"
+          }
+        },
+        "type": "object",
+        "required": [
+          "vendor",
+          "record_id",
+          "raw_revisions",
+          "normalized_event"
+        ],
+        "title": "RecordTrace"
+      },
+      "RecordValidation": {
+        "properties": {
+          "index": {
+            "type": "integer",
+            "title": "Index"
+          },
+          "record_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Record Id"
+          },
+          "outcome": {
+            "type": "string",
+            "enum": [
+              "valid",
+              "valid_with_warnings",
+              "rejected"
+            ],
+            "title": "Outcome"
+          },
+          "store_action": {
+            "type": "string",
+            "enum": [
+              "new",
+              "duplicate",
+              "revision",
+              "duplicate_in_batch",
+              "revision_in_batch"
+            ],
+            "title": "Store Action"
+          },
+          "machine_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Machine Id"
+          },
+          "event_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Event Code"
+          },
+          "event_time": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Event Time"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Warnings",
+            "default": []
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code"
+          },
+          "error_message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Message"
+          }
+        },
+        "type": "object",
+        "required": [
+          "index",
+          "record_id",
+          "outcome",
+          "store_action"
+        ],
+        "title": "RecordValidation"
+      },
+      "ReferenceData": {
+        "properties": {
+          "plants": {
+            "items": {
+              "$ref": "#/components/schemas/PlantRef"
+            },
+            "type": "array",
+            "title": "Plants"
+          }
+        },
+        "type": "object",
+        "required": [
+          "plants"
+        ],
+        "title": "ReferenceData"
+      },
+      "ReplayAccepted": {
+        "properties": {
+          "raw_id": {
+            "type": "integer",
+            "title": "Raw Id"
+          },
+          "status": {
+            "type": "string",
+            "const": "pending",
+            "title": "Status"
+          }
+        },
+        "type": "object",
+        "required": [
+          "raw_id",
+          "status"
+        ],
+        "title": "ReplayAccepted"
+      },
+      "SourceRef": {
+        "properties": {
+          "source": {
+            "type": "string",
+            "title": "Source"
+          },
+          "record_id": {
+            "type": "string",
+            "title": "Record Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "source",
+          "record_id"
+        ],
+        "title": "SourceRef"
+      },
+      "Summary": {
+        "properties": {
+          "scope": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Scope"
+          },
+          "generated_at": {
+            "type": "string",
+            "title": "Generated At"
+          },
+          "machines_total": {
+            "type": "integer",
+            "title": "Machines Total"
+          },
+          "machines_needing_attention": {
+            "type": "integer",
+            "title": "Machines Needing Attention"
+          },
+          "by_status": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "By Status"
+          },
+          "lines_ranked_by_attention": {
+            "items": {
+              "$ref": "#/components/schemas/LineSummary"
+            },
+            "type": "array",
+            "title": "Lines Ranked By Attention"
+          },
+          "critical_machines": {
+            "items": {
+              "$ref": "#/components/schemas/MachineBrief"
+            },
+            "type": "array",
+            "title": "Critical Machines"
+          },
+          "data_quality": {
+            "$ref": "#/components/schemas/DataQuality"
+          }
+        },
+        "type": "object",
+        "required": [
+          "scope",
+          "generated_at",
+          "machines_total",
+          "machines_needing_attention",
+          "by_status",
+          "lines_ranked_by_attention",
+          "critical_machines",
+          "data_quality"
+        ],
+        "title": "Summary"
+      },
+      "ThermexWatchBatch": {
+        "properties": {
+          "source": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source",
+            "examples": [
+              "ThermexWatch"
+            ]
+          },
+          "site_code": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Site Code",
+            "examples": [
+              "PLANT_01"
+            ]
+          },
+          "response_time_epoch_ms": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Response Time Epoch Ms",
+            "examples": [
+              1776499560000
+            ]
+          },
+          "readings": {
+            "items": {
+              "$ref": "#/components/schemas/ThermexWatchReading"
+            },
+            "type": "array",
+            "minItems": 1,
+            "title": "Readings",
+            "description": "Non-empty list of reading objects"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "readings"
+        ],
+        "title": "ThermexWatchBatch"
+      },
+      "ThermexWatchReading": {
+        "properties": {
+          "readingId": {
+            "title": "Readingid",
+            "description": "Vendor reading id - idempotency key (required)",
+            "examples": [
+              "TW-8801"
+            ]
+          },
+          "assetCode": {
+            "title": "Assetcode",
+            "description": "Machine reference (required)",
+            "examples": [
+              "EQ-001"
+            ]
+          },
+          "productionLine": {
+            "title": "Productionline",
+            "description": "Short line code, e.g. A -> LINE-A",
+            "examples": [
+              "A"
+            ]
+          },
+          "timestampMs": {
+            "title": "Timestampms",
+            "description": "Epoch milliseconds (epoch seconds tolerated with a warning) (required)",
+            "examples": [
+              1776499152000
+            ]
+          },
+          "alertCode": {
+            "title": "Alertcode",
+            "description": "VIB_WARN | TEMP_WARN | TEMP_CRIT | POWER_DROP | OK",
+            "examples": [
+              "VIB_WARN"
+            ]
+          },
+          "level": {
+            "title": "Level",
+            "description": "1 (nominal) .. 5 (critical)",
+            "examples": [
+              4
+            ]
+          },
+          "vibration_g": {
+            "title": "Vibration G",
+            "description": "Vibration acceleration, g (not converted to mm/s)",
+            "examples": [
+              0.81
+            ]
+          },
+          "temperature_f": {
+            "title": "Temperature F",
+            "description": "Temperature, Fahrenheit (converted to Celsius)",
+            "examples": [
+              181.2
+            ]
+          },
+          "power_kw": {
+            "title": "Power Kw",
+            "description": "Power draw, kW",
+            "examples": [
+              37.8
+            ]
+          },
+          "is_active": {
+            "title": "Is Active",
+            "description": "true -> running, false -> idle",
+            "examples": [
+              true
+            ]
+          },
+          "signal_quality": {
+            "title": "Signal Quality",
+            "description": "GOOD | FAIR | POOR",
+            "examples": [
+              "GOOD"
+            ]
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "title": "ThermexWatchReading"
       },
       "ValidationError": {
         "properties": {
@@ -665,7 +3744,232 @@
           "type"
         ],
         "title": "ValidationError"
+      },
+      "ValidationReport": {
+        "properties": {
+          "vendor": {
+            "type": "string",
+            "title": "Vendor"
+          },
+          "total_records": {
+            "type": "integer",
+            "title": "Total Records"
+          },
+          "valid": {
+            "type": "integer",
+            "title": "Valid"
+          },
+          "valid_with_warnings": {
+            "type": "integer",
+            "title": "Valid With Warnings"
+          },
+          "rejected": {
+            "type": "integer",
+            "title": "Rejected"
+          },
+          "records": {
+            "items": {
+              "$ref": "#/components/schemas/RecordValidation"
+            },
+            "type": "array",
+            "title": "Records"
+          }
+        },
+        "type": "object",
+        "required": [
+          "vendor",
+          "total_records",
+          "valid",
+          "valid_with_warnings",
+          "rejected",
+          "records"
+        ],
+        "title": "ValidationReport"
+      },
+      "VendorSlug": {
+        "type": "string",
+        "enum": [
+          "pulseforge",
+          "thermexwatch",
+          "maintaflow",
+          "workorders"
+        ],
+        "title": "VendorSlug"
+      },
+      "WorkOrder": {
+        "properties": {
+          "work_order_id": {
+            "title": "Work Order Id",
+            "description": "Work order id - idempotency key; a status change is a new revision (required)",
+            "examples": [
+              "WO-1001"
+            ]
+          },
+          "plant_id": {
+            "title": "Plant Id",
+            "description": "Plant reported by the CMMS; asset reference wins on mismatch",
+            "examples": [
+              "PLANT_01"
+            ]
+          },
+          "machine_id": {
+            "title": "Machine Id",
+            "description": "Machine reference (required)",
+            "examples": [
+              "EQ-002"
+            ]
+          },
+          "line_id": {
+            "title": "Line Id",
+            "description": "Line reference",
+            "examples": [
+              "LINE-A"
+            ]
+          },
+          "opened_at": {
+            "title": "Opened At",
+            "description": "ISO-8601 (required)",
+            "examples": [
+              "2026-04-18T08:07:00Z"
+            ]
+          },
+          "closed_at": {
+            "title": "Closed At",
+            "description": "ISO-8601; empty while open",
+            "examples": [
+              "2026-04-18T08:10:00Z"
+            ]
+          },
+          "maintenance_type": {
+            "title": "Maintenance Type",
+            "description": "e.g. cooling_system, power_check",
+            "examples": [
+              "cooling_system"
+            ]
+          },
+          "trigger_source": {
+            "title": "Trigger Source",
+            "description": "e.g. sensor_alert, operator_report, inspection",
+            "examples": [
+              "sensor_alert"
+            ]
+          },
+          "status": {
+            "title": "Status",
+            "description": "open | in_progress | closed | cancelled",
+            "examples": [
+              "open"
+            ]
+          },
+          "downtime_minutes": {
+            "title": "Downtime Minutes",
+            "description": "Non-negative number",
+            "examples": [
+              0
+            ]
+          },
+          "post_maintenance_check": {
+            "title": "Post Maintenance Check",
+            "description": "passed | failed | pending",
+            "examples": [
+              "pending"
+            ]
+          },
+          "notes": {
+            "title": "Notes",
+            "description": "Free text",
+            "examples": [
+              "Work order created after temperature spike"
+            ]
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "title": "WorkOrder"
+      },
+      "WorkOrderBatch": {
+        "properties": {
+          "source": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source",
+            "examples": [
+              "CMMS"
+            ]
+          },
+          "plant_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plant Id",
+            "examples": [
+              "PLANT_01"
+            ]
+          },
+          "work_orders": {
+            "items": {
+              "$ref": "#/components/schemas/WorkOrder"
+            },
+            "type": "array",
+            "minItems": 1,
+            "title": "Work Orders",
+            "description": "Non-empty list of work order objects"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "work_orders"
+        ],
+        "title": "WorkOrderBatch"
+      }
+    },
+    "securitySchemes": {
+      "APIKeyHeader": {
+        "type": "apiKey",
+        "description": "Required when API_KEYS is set",
+        "in": "header",
+        "name": "X-API-Key"
       }
     }
-  }
+  },
+  "tags": [
+    {
+      "name": "ingestion",
+      "description": "Accept vendor batches (async) and dry-run validation"
+    },
+    {
+      "name": "processing",
+      "description": "Batch status, dead letters, replay, traceability"
+    },
+    {
+      "name": "operational-view",
+      "description": "Derived machine view and plant/line summaries"
+    },
+    {
+      "name": "reference",
+      "description": "Asset / line reference data"
+    },
+    {
+      "name": "ops",
+      "description": "Probes and metadata"
+    },
+    {
+      "name": "demo",
+      "description": "Bundled sample payloads for the dashboard"
+    }
+  ]
 }
